@@ -1,4 +1,5 @@
 # expenses_summary
+一个MaiBot插件。
 
 ## 内容
 生成户晨风式的财务总结并发送音频。
