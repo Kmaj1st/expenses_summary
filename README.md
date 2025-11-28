@@ -15,5 +15,5 @@
 ### Command（指令触发）
 使用指令 `/expenses`
 
-### TODO
+## TODO
 每日定时发送
