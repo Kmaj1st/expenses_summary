@@ -1,0 +1,43 @@
+{
+  "manifest_version": 1,
+  "name": "麦晨风财务总结插件(Expenses Summary)",
+  "version": "1.0.0",
+  "description": "生成今日财务总结，让麦晨风成为你的财务小助手。",
+  "author": {
+    "name": "Kmaj",
+    "url": "https://github.com/Kmaj1st"
+  },
+  "license": "GPL-v3.0-or-later",
+  
+  "host_application": {
+    "min_version": "0.11.5"
+  },
+  "homepage_url": "https://github.com/Kmaj1st/expenses_summary",
+  "repository_url": "https://github.com/Kmaj1st/expenses_summary",
+  "keywords": ["Expenses", "Summary", "Costs", "Finance"],
+  "categories": ["Summary", "Expenses", "Costs", "HuChenFeng", "Message"],
+  
+  "default_locale": "zh-CN",
+  "locales_path": "_locales",
+  
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "general",
+    "components": [
+      {
+        "type": "action",
+        "name": "generate_expenses_summary",
+        "description": "生成今日财务总结"
+      },
+      {
+        "type": "command",
+        "name": "expenses",
+        "description": "生成今日财务总结",
+        "pattern": "/expenses"
+      }
+    ],
+    "features": [
+      "生成今日财务总结"
+    ]
+  }
+}
