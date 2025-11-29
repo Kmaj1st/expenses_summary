@@ -5,7 +5,7 @@ Author: Kmaj
 import asyncio
 import random
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Type
 
@@ -13,6 +13,7 @@ from src.chat.message_receive.chat_stream import ChatStream
 from src.common.data_models.database_data_model import DatabaseMessages
 from src.common.logger import get_logger
 from src.plugin_system.apis import send_api
+from src.plugin_system.apis.chat_api import ChatManager
 from src.plugin_system.apis.config_api import get_global_config
 from src.plugin_system.apis.llm_api import generate_with_model, \
     get_available_models
@@ -30,17 +31,6 @@ from src.webui.statistics_routes import DashboardData, StatisticsSummary, \
     get_dashboard_data
 
 logger = get_logger("expenses_summary")
-
-
-class ExpensesSummaryTool(BaseTool):
-    """生成今日财务总结的工具"""
-
-    name = "expenses_summary"
-    description = "生成今日的财务总结的恶搞版string, 模仿户晨风的风格"
-    available_for_llm = True
-
-    async def execute(self) -> str:
-        return get_summary_str(self)
 
 
 class ExpensesSummaryAction(BaseAction):
@@ -80,14 +70,7 @@ class ExpensesSummaryAction(BaseAction):
             )
 
         try:
-            self.audio_enabled = self.get_config(
-                key="audio.enabled",
-                default=False
-            )
-            self.url = self.get_config(
-                key="audio.file_location",
-                default=(Path(__file__).parent / "audio.mp3").as_posix()
-            )
+            self.audio_enabled, self.url = get_audio_config(self)
         except Exception as e:
             logger.error(f"获取音频开启状态或音频路径出错,将不发送音频: {e}")
             self.audio_enabled = False
@@ -96,7 +79,8 @@ class ExpensesSummaryAction(BaseAction):
         """执行问候动作 - 这是核心功能"""
         # send summary
         try:
-            summary_str = await get_summary_str(self)
+            gen_conf = await get_generation_config(self)
+            summary_str = await get_summary_str(*gen_conf)
             if not summary_str:
                 return False, "未能生成财务总结, 总结为空"
             await self.send_text(summary_str)
@@ -108,7 +92,10 @@ class ExpensesSummaryAction(BaseAction):
         if self.audio_enabled:
             try:
                 await send_api.custom_to_stream(
-                    "voiceurl", self.url, stream_id)
+                    message_type="voiceurl",
+                    content=self.url,
+                    stream_id=stream_id
+                )
             except Exception as e:
                 logger.error(f"发送BGM音频失败: {e}")
 
@@ -125,22 +112,12 @@ class ExpensesSummaryCommand(BaseCommand):
 
     def __init__(self, message, plugin_config=None):
         super().__init__(message, plugin_config)
-        try:
-            self.audio_enabled = self.get_config(
-                key="audio.enabled",
-                default=False
-            )
-            self.url = self.get_config(
-                key="audio.file_location",
-                default=(Path(__file__).parent / "audio.mp3").as_posix()
-            )
-        except Exception as e:
-            logger.error(f"获取音频开启状态或音频路径出错,将不发送音频: {e}")
-            self.audio_enabled = False
+        self.audio_enabled, self.url = get_audio_config(self)
 
     async def execute(self) -> Tuple[bool, str, bool]:
         try:
-            summary_str = await get_summary_str(self)
+            gen_conf = await get_generation_config(self)
+            summary_str = await get_summary_str(*gen_conf)
             if not summary_str:
                 return False, "未能生成财务总结, 总结为空", True
             await self.send_text(summary_str)
@@ -152,10 +129,25 @@ class ExpensesSummaryCommand(BaseCommand):
         if self.audio_enabled:
             try:
                 await send_api.custom_to_stream(
-                    "voiceurl", self.url, stream_id)
+                    message_type="voiceurl",
+                    content=self.url,
+                    stream_id=stream_id
+                )
             except Exception as e:
                 logger.error(f"发送BGM音频失败: {e}")
         return True, "通过调用命令成功发送了财务总结", True
+
+
+class ExpensesSummaryTool(BaseTool):
+    """生成今日财务总结的工具"""
+
+    name = "expenses_summary"
+    description = "生成今日的财务总结的恶搞版string, 模仿户晨风的风格"
+    available_for_llm = True
+
+    async def execute(self) -> str:
+        gen_conf = await get_generation_config(self)
+        return get_summary_str(*gen_conf)
 
 
 @register_plugin
@@ -182,6 +174,20 @@ class ExpensesSummaryPlugin(BasePlugin):
                                           description="配置文件版本"),
             "enabled": ConfigField(type=bool, default=True,
                                    description="是否启用插件"),
+        },
+        "scheduler": {
+            "enabled": ConfigField(type=bool, default=False,
+                                   description="是否启用定时任务"),
+            "time": ConfigField(type=str, default="23:30",
+                                description="于每日hh:mm自动发送财务总结"),
+            "qq_groups": ConfigField(
+                type=list[str], default=["111", "222"],
+                description="定时发送财务总结的QQ群列表"
+            ),
+            "qq_private": ConfigField(
+                type=list[str], default=["333", "444"],
+                description="定时发送财务总结的QQ私聊列表"
+            )
         },
         "fallback": {
             "xiao_name": ConfigField(
@@ -212,9 +218,22 @@ class ExpensesSummaryPlugin(BasePlugin):
         "other": {
             "thanks_list": ConfigField(type=List[str],
                                        default=["810", "艾斯比"],
-                                       description="感谢名单")
+                                       description="感谢名单"),
         }
     }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scheduler = ExpensesScheduler(self)
+        asyncio.create_task(self._start_scheduler_after_delay())
+
+    async def _start_scheduler_after_delay(self):
+        """延迟启动定时任务"""
+        await asyncio.sleep(10)
+        if self.scheduler:
+            await self.scheduler.start()
+        else:
+            logger.error("初始化定时任务失败")
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         """
@@ -227,21 +246,146 @@ class ExpensesSummaryPlugin(BasePlugin):
         ]
 
 
-async def get_summary_str(
-        caller: ExpensesSummaryAction
-        | ExpensesSummaryCommand
-        | ExpensesSummaryTool) -> str:
+class ExpensesScheduler:
+    """财务总结定时任务"""
+
+    def __init__(self, plugin: ExpensesSummaryPlugin):
+        self.plugin = plugin    # 插件
+        self.enabled = None     # 是否启用
+        self.trigger_t = None   # 触发时间
+        self.gen_conf = None   # 生成配置
+        self.stream_ids = []    # 聊天流ID
+        self.audio_enabled = None   # 是否启用音频
+        self.audio_file = None  # 音频文件
+        self.logger = get_logger("ExpensesScheduler")
+        self.is_running = False
+        self.task = None
+
+    async def _init(self):
+        """初始化定时任务需要的配置"""
+        try:
+            self.enabled, self.trigger_t, qq_groups, qq_private = \
+                await get_scheduler_config(self.plugin)
+            self.gen_conf = await get_generation_config(self.plugin)
+            self.audio_enabled, self.audio_file = \
+                await get_audio_config(self.plugin)
+        except Exception as e:
+            self.logger.error(f"获取定时任务配置失败: {e}")
+            return
+
+        try:
+            for gid in qq_groups:
+                gs: ChatStream = ChatManager.get_group_stream_by_group_id(gid)
+                if gs:
+                    if gs not in self.stream_ids:
+                        self.stream_ids.append(gs.stream_id)
+            for pid in qq_private:
+                ps: ChatStream = ChatManager.get_private_stream_by_user_id(pid)
+                if ps:
+                    if ps not in self.stream_ids:
+                        self.stream_ids.append(ps.stream_id)
+        except Exception as e:
+            self.logger.error(f"获取聊天流失败: {e}")
+
+    async def start(self):
+        """启动定时任务"""
+        if self.is_running:
+            return
+
+        if self.enabled is None:
+            await self._init()
+
+        if self.enabled:
+            self.is_running = True
+            self.task = asyncio.create_task(self._schedule_loop())
+            self.logger.info(f"设置的触发时间是: {self.trigger_t}")
+        elif self.enabled is False:
+            self.logger.info("定时任务已关闭")
+        else:
+            self.logger.info("定时任务启动失败")
+
+    async def _schedule_loop(self):
+        """定时任务循环"""
+        now = datetime.now()
+        next_t = now.replace(
+            hour=int(self.trigger_t.split(":")[0]),
+            minute=int(self.trigger_t.split(":")[1]),
+            second=0,
+            microsecond=0
+        )
+        if now > next_t:    # 如果设定是在AM, 但现在在PM
+            next_t += timedelta(days=1)
+
+        while True:
+            now = datetime.now()
+            if now <= next_t:
+                try:
+                    seconds = max((next_t - now).total_seconds(), 0)
+                    self.logger.info("将在%s自动发送财务总结" %
+                                     next_t.strftime("%Y-%m-%d %H:%M:%S"))
+                    await asyncio.sleep(seconds)
+                except Exception as e:
+                    self.logger.error(f"谁打扰了我的睡眠: {e}")
+                    return
+            self.logger.info("自动发送财务总结")
+            next_t += timedelta(days=1)
+            text_exceptions = []
+            audio_exceptions = []
+            try:
+                summary_str = await get_summary_str(*self.gen_conf)
+                if not summary_str:
+                    return False, "未能生成财务总结, 总结为空"
+                for s in self.stream_ids:
+                    try:
+                        await send_api.text_to_stream(text=summary_str,
+                                                      stream_id=s)
+                    except Exception as e:
+                        text_exceptions.append([s, e])
+                self.logger.info("发送了财务总结")
+                if self.audio_enabled:
+                    for s in self.stream_ids:
+                        try:
+                            await send_api.custom_to_stream(
+                                message_type="voiceurl",
+                                content=self.audio_file,
+                                stream_id=s
+                            )
+                        except Exception as e:
+                            audio_exceptions.append([s, e])
+                    self.logger.info("发送了BGM音频")
+                else:
+                    self.logger.info("未启用音频")
+            except Exception as e:
+                self.logger.error(f"生成财务总结失败: {e}")
+                if now > next_t:
+                    next_t += timedelta(days=1)
+
+
+async def get_summary_str(personality: str,
+                          names: List[str],
+                          fb_xnames: List[str],
+                          fb_loc: List[str],
+                          fb_poems: List[str],
+                          thanks_list: List[str]) -> str:
     """
-    生成今日收入&支出总结
+    生成今日财务总结
+
+    Args:
+        personality: 人格
+        names: 设定的名字
+        fb_xnames: fallback的名字
+        fb_loc: fallback的地点
+        fb_poems: fallback的诗
+        thanks_list: 感谢名单
+
+    Returns:
+        str: 今日财务总结
     """
     dash = await _get_dash_stats_today()
 
     model_expenses_str = _get_model_expenses_str(dash=dash)
 
     today = datetime.now().strftime("%Y年%m月%d日")
-
-    config_values = await _get_config_values(caller=caller)
-    personality, names, fb_xnames, fb_loc, fb_poems = config_values
 
     xiao_name, location, went_to, poem = await _get_settings(
         personality=personality,
@@ -253,15 +397,7 @@ async def get_summary_str(
 
     ss: StatisticsSummary = dash.summary
 
-    try:
-        thanks_list = caller.get_config(
-            key="other.thanks_list",
-            default=["810", "艾斯比"]
-        )
-        thanks_str = "、".join(thanks_list)
-    except Exception as e:
-        logger.error(f"获取感谢名单失败: {e}")
-        thanks_str = "了不起的比尔·盖茨、马斯克·扎克伯格"
+    thanks_str = "、".join(thanks_list)
 
     # summary str
     summary = f"我是{xiao_name}，我在{location}向各位网友兼股东汇报{today}我在全网的收入情况。\n"
@@ -269,10 +405,10 @@ async def get_summary_str(
     summary += f"我在{today}的税前总收入为：0万0元💸。其中：所有收入 0万0元。\n"
     summary += "除广告收入和带货佣金外，在缴纳了约25%即 0万0元 的个人所得税之后，"
     summary += "此为系统自动扣除，"
-    summary += "***不🙅‍♀️可🙅‍♀️能🙅‍♀️不🙅‍♀️交*** 😡💢（咬牙切齿🦷），"
+    summary += "***不🙅‍♀️可🙅‍♀️能🙅‍♀️不🙅‍♀️交*** 😡💢（咬牙切齿😣），"
     summary += "我的税后总收入为 0万0元🙃。\n\n"
 
-    summary += "以上为我的收入情况，下面是我的支出情况👇\n\n"
+    summary += "🖕以上为我的收入情况，下面是我的支出情况👇\n\n"
 
     summary += f"{today}{went_to}\n"
     summary += f"累计请求API {ss.total_requests} 次🔁，"
@@ -326,6 +462,15 @@ async def _get_settings(personality: str,
     Returns:
         Tuple[str, str, str]: 小名，地点和诗句
     """
+    def _safe_extract(task_result):
+        from re import sub
+        if isinstance(task_result, Exception):
+            return ""
+        success, result, _, _ = task_result
+        return sub(
+            r'["“”\'‘’]', '', (result or "").strip().replace("\n", " ")
+        ) if success else ""
+
     xiao_name = None
     location = None
     went_to = None
@@ -338,15 +483,15 @@ async def _get_settings(personality: str,
             prompt="从以下名字中任选一个构造可爱小名,只返回“小X”形式."
             f"不要任何解释:{','.join(names)}",
             model_config=replyer,
-            temperature=0.5,
+            temperature=1.0,
             max_tokens=8
         )
         location_task = generate_with_model(
             prompt=f"她{personality},她现在最不可能在什么地方?"
             "可以是真实城市,自宅卧室,火星,深海,丛林,KFC,任意梦幻或搞笑地点."
-            "尽量搞怪.只返回地点名称,可以很长也可以很短.",
+            "尽量搞怪.只返回地点名称,可长可短.",
             model_config=replyer,
-            temperature=0.5,
+            temperature=0.8,
             max_tokens=60
         )
         went_to_task = generate_with_model(
@@ -356,16 +501,18 @@ async def _get_settings(personality: str,
             "请把所有的{{地点}}都替换为那些地方."
             "所有的地点后面要加一个emoji."
             "可以是真实城市,自宅卧室,火星,深海,丛林,KFC,任意梦幻或搞笑地点."
-            "尽量搞怪.只返回那句套了模板的句子,可以很长也可以很短.",
+            "尽量搞怪.只返回那句套了模板的句子,可长可短.",
             model_config=replyer,
-            temperature=0.5,
+            temperature=0.8,
             max_tokens=120
         )
         poem_task = generate_with_model(
-            prompt="给我两句诗句(可以是中文,古诗改编,日文,英文,任何语言都行)."
+            prompt="给我两句随机的诗句或者歌词甚至是台词引用(任何语言都行)."
+            "例如:\"爸爸的爸爸叫爷爷, 爸爸的妈妈叫奶奶.\""
+            "或者是\"你怎么穿着品如的衣服,还用着她的东西?\""
             "控制在40字以内.只返回诗句.",
             model_config=replyer,
-            temperature=0.5,
+            temperature=0.8,
             max_tokens=60
         )
 
@@ -377,14 +524,8 @@ async def _get_settings(personality: str,
             return_exceptions=True
         )
 
-        def safe_extract(task_result):
-            if isinstance(task_result, Exception):
-                return ""
-            success, result, _, _ = task_result
-            return (result or "").strip().replace("\n", " ") if success else ""
-
         xiao_name, location, went_to, poem = [
-            safe_extract(r) for r in raw_results]
+            _safe_extract(r) for r in raw_results]
     except Exception as e:
         logger.error(f"生成随机要素失败, 将使用fallback: {e}")
     try:
@@ -402,12 +543,83 @@ async def _get_settings(personality: str,
     return xiao_name, location, went_to, poem
 
 
-async def _get_config_values(caller: ExpensesSummaryAction
-                             | ExpensesSummaryCommand
-                             | ExpensesSummaryTool) -> tuple[
-        str, List[str], List[str], List[str], List[str]]:
+async def get_audio_config(
+        caller: ExpensesSummaryAction
+        | ExpensesSummaryCommand
+        | ExpensesSummaryTool
+        | ExpensesSummaryPlugin) -> tuple[bool, str]:
     """
-    获取插件配置
+    获取插件配置, 返回所有与生成音频有关的配置
+
+    Args:
+        caller: ExpensesSummaryAction
+            | ExpensesSummaryCommand
+            | ExpensesSummaryTool
+
+    Returns:
+        bool: 是否启用音频
+        str: 音频文件目录
+    """
+    try:
+        return caller.get_config(
+            key="audio.enabled",
+            default=True
+        ), caller.get_config(
+            key="audio.file_location",
+            default=""
+        )
+    except Exception as e:
+        logger.error(f"获取音频开启状态或音频路径出错,将不发送音频: {e}")
+        return False, ""
+
+
+async def get_scheduler_config(
+        caller: ExpensesSummaryAction
+        | ExpensesSummaryCommand
+        | ExpensesSummaryTool
+        | ExpensesSummaryPlugin) -> tuple[bool, str, List[int], List[int]]:
+    """
+    获取插件配置, 返回所有与定时任务有关的配置
+
+    Args:
+        caller: ExpensesSummaryAction
+            | ExpensesSummaryCommand
+            | ExpensesSummaryTool
+
+    Returns:
+        bool: 是否启用定时任务
+        str: 定时任务时间
+        List[int]: qq群列表
+        List[int]: 私聊列表
+    """
+    try:
+        return caller.get_config(
+            key="scheduler.enabled",
+            default=False
+        ), caller.get_config(
+            key="scheduler.time",
+            default="23:30"
+        ), caller.get_config(
+            key="scheduler.qq_groups",
+            default=[]
+        ), caller.get_config(
+            key="scheduler.qq_private",
+            default=[]
+        )
+    except Exception as e:
+        logger.error(f"获取定时任务开启状态或时间出错,将不启用定时任务: {e}")
+        return False, ""
+
+
+async def get_generation_config(
+        caller: ExpensesSummaryAction
+        | ExpensesSummaryCommand
+        | ExpensesSummaryTool
+        | ExpensesSummaryPlugin) -> tuple[
+            str, List[str], List[str], List[str], List[str], List[str]
+        ]:
+    """
+    获取插件配置, 返回所有与生成内容有关的配置
 
     Args:
         caller: ExpensesSummaryAction
@@ -420,6 +632,7 @@ async def _get_config_values(caller: ExpensesSummaryAction
         List[str]: fallback的名字
         List[str]: fallback的地点
         List[str]: fallback的诗
+        List[str]: 感谢名单
     """
     # read config
     try:
@@ -445,6 +658,10 @@ async def _get_config_values(caller: ExpensesSummaryAction
                 "Shut up! I read this inside the book I read before."
             ]
         )
+        thanks_list = caller.get_config(
+            key="fallback.thanks_list",
+            default=["810", "艾斯比"]
+        )
     except Exception as e:
         logger.error(f"读取配置失败,使用默认值: {e}")
         names = ["小爱"]
@@ -454,7 +671,7 @@ async def _get_config_values(caller: ExpensesSummaryAction
             "Shut up! I read this inside the book I read before."
         ]
 
-    return personality, names, fb_xnames, fb_loc, fb_poems
+    return personality, names, fb_xnames, fb_loc, fb_poems, thanks_list
 
 
 async def _get_dash_stats_today() -> DashboardData:
