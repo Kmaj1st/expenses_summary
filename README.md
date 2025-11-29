@@ -54,3 +54,6 @@ deepseek-ai/DeepSeek-V3.2-Exp：0.1265 元
 
 ## 安装
 把插件扔进 `plugins` 目录，重启 MaiBot 即可。
+
+## TODO
+更好的日志
